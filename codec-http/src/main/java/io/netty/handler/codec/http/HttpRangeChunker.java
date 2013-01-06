@@ -1,12 +1,12 @@
 /*
  * Copyright 2012 The Netty Project
- * 
+ *
  * The Netty Project licenses this file to you under the Apache License, version
  * 2.0 (the "License"); you may not use this file except in compliance with the
  * License. You may obtain a copy of the License at:
- * 
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
@@ -63,7 +63,6 @@ public class HttpRangeChunker extends SimpleChannelHandler {
     } else if (range.startsWith("bytes=")) {
       rangeMarker = range;
     } else {
-
       // TODO: really want to return a response indicating bad range
       // request?
       throw new SyntacticallyInvalidByteRangeException(range);
@@ -95,7 +94,6 @@ public class HttpRangeChunker extends SimpleChannelHandler {
         // do any processing in here.
         ctx.sendDownstream(e);
       } else {
-
         Object rangeMarker = rangeQueue.poll();
 
         if (rangeMarker == null) {
@@ -105,7 +103,6 @@ public class HttpRangeChunker extends SimpleChannelHandler {
         if (rangeMarker == NO_RANGE_HEADER) {
           ctx.sendDownstream(e);
         } else {
-
           // TODO: Support If-Range conditional check
 
           boolean hasContent = m.isChunked() || m.getContent().readable();
@@ -209,7 +206,7 @@ public class HttpRangeChunker extends SimpleChannelHandler {
     return new EncoderEmbedder<ChannelBuffer>(new RangeEncoder(brs));
   }
 
-  static class RangeEncoder extends OneToOneEncoder implements LifeCycleAwareChannelHandler {
+  static final class RangeEncoder extends OneToOneEncoder implements LifeCycleAwareChannelHandler {
 
     private ChannelHandlerContext ctx;
 
@@ -261,6 +258,5 @@ public class HttpRangeChunker extends SimpleChannelHandler {
 
       return result;
     }
-
   }
 }

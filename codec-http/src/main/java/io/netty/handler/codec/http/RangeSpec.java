@@ -1,12 +1,12 @@
 /*
  * Copyright 2012 The Netty Project
- * 
+ *
  * The Netty Project licenses this file to you under the Apache License, version
  * 2.0 (the "License"); you may not use this file except in compliance with the
  * License. You may obtain a copy of the License at:
- * 
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
@@ -52,10 +52,10 @@ class RangeSpec {
 
         /*
          * c.f. http://tools.ietf.org/html/rfc2616#page-139
-         * 
+         *
          * "If the entity is shorter than the specified suffix-length, the
          * entire entity-body is used."
-         * 
+         *
          * => use Math.max to set the final field.
          */
         this.start = Math.max(contentLength - number, 0);
@@ -70,11 +70,11 @@ class RangeSpec {
 
           /*
            * c.f. http://tools.ietf.org/html/rfc2616#section-14.35
-           * 
+           *
            * "if the value is greater than or equal to the current length of the
            * entity-body, last-byte-pos is taken to be equal to one less than
            * the current length of the entity- body in bytes."
-           * 
+           *
            * => use Math.min
            */
           this.end = Math.min(contentLength - 1, Integer.parseInt(byteRangeSpec.substring(pos)));
@@ -98,7 +98,7 @@ class RangeSpec {
 
   /**
    * Private constructor used to create the results of merge operations.
-   * 
+   *
    * @param start
    * @param end
    * @param contentLength
@@ -112,7 +112,7 @@ class RangeSpec {
 
   /**
    * Returns a representation suitable for use as a Content-Range header value.
-   * 
+   *
    * @param contentLength
    *          the entity size
    * @return a non-null String
