@@ -15,17 +15,14 @@
  */
 package io.netty.handler.codec.http;
 
-import io.netty.buffer.ChannelBuffer;
-import io.netty.buffer.ChannelBuffers;
-import io.netty.channel.Channel;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.LifeCycleAwareChannelHandler;
-import io.netty.channel.MessageEvent;
-import io.netty.channel.SimpleChannelHandler;
-import io.netty.handler.codec.embedder.EncoderEmbedder;
-import io.netty.handler.codec.oneone.OneToOneEncoder;
-import io.netty.util.internal.QueueFactory;
+import io.netty.channel.embedded.EmbeddedByteChannel;
+import io.netty.handler.codec.MessageToMessageCodec;
+import io.netty.handler.codec.MessageToMessageEncoder;
 
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Queue;
 
@@ -33,180 +30,181 @@ import java.util.Queue;
  * Attempts to honour a Range request header by inspecting the incoming header
  * on the request and filtering the response output appropriately.
  */
-public class HttpRangeChunker extends SimpleChannelHandler {
+public class HttpRangeChunker extends MessageToMessageCodec<HttpMessage, HttpMessage> {
 
-  private final Queue<Object> rangeQueue = QueueFactory.createQueue(Object.class);
+  private volatile EmbeddedByteChannel encoder;
+
+  private final Queue<Object> rangeQueue = new ArrayDeque<Object>();
 
   private static final Object NO_RANGE_HEADER = new Object();
 
-  private volatile EncoderEmbedder<ChannelBuffer> encoder;
+  private HttpMessage message;
 
   /**
    * {@inheritDoc}
    */
   @Override
-  public void messageReceived(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
-    Object msg = e.getMessage();
-
-    if (!(msg instanceof HttpMessage)) {
-      ctx.sendUpstream(e);
-      return;
-    }
-
-    HttpMessage m = (HttpMessage) msg;
-    String range = m.getHeader(HttpHeaders.Names.RANGE);
-
-    Object rangeMarker;
-
-    if (range == null) {
-      rangeMarker = NO_RANGE_HEADER;
-    } else if (range.startsWith("bytes=")) {
-      rangeMarker = range;
-    } else {
-      // TODO: really want to return a response indicating bad range
-      // request?
-      throw new SyntacticallyInvalidByteRangeException(range);
-    }
-
-    boolean offered = rangeQueue.offer(rangeMarker);
-    assert offered;
-
-    ctx.sendUpstream(e);
-  }
-
-  /**
-   * {@inheritDoc}
-   */
-  @Override
-  public void writeRequested(ChannelHandlerContext ctx, MessageEvent e) throws Exception {
-    Object msg = e.getMessage();
-
-    if (msg instanceof HttpResponse && ((HttpResponse) msg).getStatus().getCode() != 200) {
+  protected Object encode(ChannelHandlerContext ctx, HttpMessage msg) throws Exception {
+    if (msg instanceof HttpResponse && ((HttpResponse) msg).getStatus().code() != 200) {
       // Non-200 responses should not have Range processing applied
-      ctx.sendDownstream(e);
-    } else if (msg instanceof HttpMessage) {
-      HttpMessage m = (HttpMessage) msg;
+      return msg;
+    }
 
-      String contentRange = m.getHeader(HttpHeaders.Names.CONTENT_RANGE);
+    // handle the case of single complete message without content
+    if (msg instanceof FullHttpMessage && !((FullHttpMessage) msg).data().isReadable()) {
 
-      if (contentRange != null) {
-        // Something has already set the Content-Range header, so don't
-        // do any processing in here.
-        ctx.sendDownstream(e);
+      // Remove content encoding
+      Object range = rangeQueue.poll();
+      if (range == null) {
+        throw new IllegalStateException("cannot send more responses than requests");
+      }
+
+      return ((FullHttpMessage) msg).retain();
+    }
+
+    if (msg instanceof HttpMessage) {
+      assert message == null;
+
+      // check if this message is also of type HttpContent is such case just
+      // make a safe copy of the headers
+      // as the content will get handled later and this simplify the handling
+      if (msg instanceof HttpContent) {
+        if (msg instanceof HttpRequest) {
+          HttpRequest req = (HttpRequest) msg;
+          message = new DefaultHttpRequest(req.getProtocolVersion(), req.getMethod(), req.getUri());
+          message.headers().set(req.headers());
+        } else if (msg instanceof HttpResponse) {
+          HttpResponse res = (HttpResponse) msg;
+          message = new DefaultHttpResponse(res.getProtocolVersion(), res.getStatus());
+          message.headers().set(res.headers());
+        } else {
+          return msg;
+        }
       } else {
-        Object rangeMarker = rangeQueue.poll();
+        message = msg;
+      }
 
-        if (rangeMarker == null) {
-          throw new IllegalStateException("cannot send more responses than requests");
+      cleanup();
+    }
+
+    HttpMessage m = msg;
+
+    String contentRange = HttpHeaders.getHeader(m, HttpHeaders.Names.CONTENT_RANGE);
+
+    if (contentRange != null) {
+
+      // Something has already set the Content-Range header, so don't do any
+      // processing in here.
+      return msg;
+    }
+
+    if (msg instanceof HttpContent) {
+      HttpContent c = (HttpContent) msg;
+
+      Object rangeMarker = rangeQueue.poll();
+
+      if (rangeMarker == null) {
+        throw new IllegalStateException("cannot send more responses than requests");
+      }
+
+      if (rangeMarker == NO_RANGE_HEADER) {
+
+        // Not a Range request - ignore
+        return msg;
+      }
+
+      HttpMessage message = this.message;
+      HttpHeaders headers = message.headers();
+      this.message = null;
+
+      // TODO: Support If-Range conditional check
+
+      boolean hasContent = c.data().isReadable();
+
+      String range = (String) rangeMarker;
+
+      // TODO: readableBytes probably not quite right - we want the full size of
+      // the representation
+      ByteRangeSet brs = ByteRangeSet.parse(range.substring(6), c.data().readableBytes());
+
+      if (hasContent && (encoder = newContentRangeEncoder(brs)) != null) {
+
+        if (m instanceof HttpResponse) {
+          ((HttpResponse) m).setStatus(HttpResponseStatus.PARTIAL_CONTENT);
         }
 
-        if (rangeMarker == NO_RANGE_HEADER) {
-          ctx.sendDownstream(e);
-        } else {
-          // TODO: Support If-Range conditional check
+        if (!HttpHeaders.isTransferEncodingChunked(m)) {
+          ByteBuf content = c.data();
 
-          boolean hasContent = m.isChunked() || m.getContent().readable();
+          if (brs.size() == 1) {
 
-          String range = (String) rangeMarker;
+            // Encode the content.
+            ByteBuf newContent = Unpooled.buffer();
+            encode(content, newContent);
+            finishEncode(newContent);
 
-          ByteRangeSet brs = ByteRangeSet.parse(range.substring(6), m.getContent().readableBytes());
+            // Replace the content.
+            c = new DefaultHttpContent(newContent);
 
-          if (hasContent && (encoder = newContentRangeEncoder(brs)) != null) {
+            // Set the headers
+            headers.set(HttpHeaders.Names.CONTENT_RANGE, brs.get(0).asContentRange());
 
-            if (m instanceof HttpResponse) {
-              ((HttpResponse) m).setStatus(HttpResponseStatus.PARTIAL_CONTENT);
-            }
+            headers
+                .set(HttpHeaders.Names.CONTENT_LENGTH, Integer.toString(content.readableBytes()));
 
-            if (!m.isChunked()) {
-              ChannelBuffer content = m.getContent();
+            return new Object[] { msg, c };
+          } else {
+            assert brs.size() > 1;
 
-              if (brs.size() == 1) {
+            throw new UnsupportedOperationException("Not implemented");
 
-                // Encode the content.
-                content = ChannelBuffers.wrappedBuffer(encode(content), finishEncode());
-
-                // Replace the content.
-                m.setContent(content);
-                m.setHeader(HttpHeaders.Names.CONTENT_RANGE, brs.get(0).asContentRange());
-                if (m.containsHeader(HttpHeaders.Names.CONTENT_LENGTH)) {
-                  m.setHeader(HttpHeaders.Names.CONTENT_LENGTH,
-                      Integer.toString(content.readableBytes()));
-                }
-              } else {
-                assert brs.size() > 1;
-
-                throw new UnsupportedOperationException("Not implemented");
-
-                // TODO: Need to send a multipart/byteranges
-                // response.
-              }
-            }
+            // TODO: Need to send a multipart/byteranges
+            // response.
           }
-
-          // Because HttpMessage is a mutable object, we can simply
-          // forward the write request.
-          ctx.sendDownstream(e);
         }
       }
-    } else if (msg instanceof HttpChunk) {
-      ctx.sendDownstream(e);
-
-      // HttpChunk c = (HttpChunk) msg;
-      // ChannelBuffer content = c.getContent();
-      //
-      // // Encode the chunk if necessary.
-      // if (encoder != null) {
-      // if (!c.isLast()) {
-      // content = encode(content);
-      // if (content.readable()) {
-      // c.setContent(content);
-      // ctx.sendDownstream(e);
-      // }
-      // } else {
-      // ChannelBuffer lastProduct = finishEncode();
-      //
-      // // Generate an additional chunk if the decoder produced
-      // // the last product on closure,
-      // if (lastProduct.readable()) {
-      // Channels.write(ctx, Channels.succeededFuture(e.getChannel()),
-      // new DefaultHttpChunk(lastProduct), e.getRemoteAddress());
-      // }
-      //
-      // // Emit the last chunk.
-      // ctx.sendDownstream(e);
-      // }
-      // } else {
-      // ctx.sendDownstream(e);
-      // }
+      // Because HttpMessage is a mutable object, we can simply
+      // forward the write request.
+      return msg;
     } else {
-      ctx.sendDownstream(e);
+      return msg;
     }
   }
 
-  private ChannelBuffer encode(ChannelBuffer buf) {
-    encoder.offer(buf);
-    return ChannelBuffers.wrappedBuffer(encoder.pollAll(new ChannelBuffer[encoder.size()]));
+  private void cleanup() {
+    if (encoder != null) {
+      // Clean-up the previous encoder if not cleaned up correctly.
+      finishEncode(Unpooled.buffer());
+    }
   }
 
-  private ChannelBuffer finishEncode() {
-    ChannelBuffer result;
+  private void encode(ByteBuf in, ByteBuf out) {
+    encoder.writeOutbound(in);
+    fetchEncoderOutput(out);
+  }
 
+  private void finishEncode(ByteBuf out) {
     if (encoder.finish()) {
-      result = ChannelBuffers.wrappedBuffer(encoder.pollAll(new ChannelBuffer[encoder.size()]));
-    } else {
-      result = ChannelBuffers.EMPTY_BUFFER;
+      fetchEncoderOutput(out);
     }
-
     encoder = null;
-
-    return result;
   }
 
-  private EncoderEmbedder<ChannelBuffer> newContentRangeEncoder(ByteRangeSet brs) {
-    return new EncoderEmbedder<ChannelBuffer>(new RangeEncoder(brs));
+  private void fetchEncoderOutput(ByteBuf out) {
+    for (;;) {
+      ByteBuf buf = encoder.readOutbound();
+      if (buf == null) {
+        break;
+      }
+      out.writeBytes(buf);
+    }
   }
 
-  static final class RangeEncoder extends OneToOneEncoder implements LifeCycleAwareChannelHandler {
+  private EmbeddedByteChannel newContentRangeEncoder(ByteRangeSet brs) {
+    return new EmbeddedByteChannel(new RangeEncoder(brs));
+  }
+
+  static final class RangeEncoder extends MessageToMessageEncoder<ByteBuf> {
 
     private ChannelHandlerContext ctx;
 
@@ -221,42 +219,52 @@ public class HttpRangeChunker extends SimpleChannelHandler {
       this.ctx = ctx;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
-    public void afterAdd(ChannelHandlerContext ctx) throws Exception {
-      // no-op
-    }
+    protected ByteBuf encode(ChannelHandlerContext ctx, ByteBuf msg) throws Exception {
+      ByteBuf result = msg;
 
-    @Override
-    public void beforeRemove(ChannelHandlerContext ctx) throws Exception {
-      // no-op
-    }
-
-    @Override
-    public void afterRemove(ChannelHandlerContext ctx) throws Exception {
-      // no-op
-    }
-
-    @Override
-    protected Object encode(ChannelHandlerContext ctx, Channel channel, Object msg)
-        throws Exception {
-      if (!(msg instanceof ChannelBuffer)) {
-        return msg;
-      }
-
-      ChannelBuffer result = (ChannelBuffer) msg;
-
-      ChannelBuffer raw = (ChannelBuffer) msg;
+      ByteBuf raw = msg;
       byte[] in = new byte[raw.readableBytes()];
       raw.readBytes(in);
 
       RangeSpec spec = brs.get(0);
 
       byte[] out = Arrays.copyOfRange(in, spec.start, spec.length);
-
-      result = ctx.getChannel().getConfig().getBufferFactory()
-          .getBuffer(raw.order(), out, 0, spec.length);
+      // FIXME:
+      // result = ctx.channel().config().bufferFactory()
+      // .getBuffer(raw.order(), out, 0, spec.length);
 
       return result;
     }
   }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  protected HttpMessage decode(ChannelHandlerContext ctx, HttpMessage msg) throws Exception {
+    String range = HttpHeaders.getHeader(msg, HttpHeaders.Names.RANGE);
+
+    Object rangeMarker;
+
+    if (range == null) {
+      rangeMarker = NO_RANGE_HEADER;
+    } else if (range.startsWith("bytes=")) {
+      rangeMarker = range;
+    } else {
+      // TODO: really want to return a response indicating bad range
+      // request? Maybe have another marker for invalid range request which
+      // #encode can handle?
+      throw new SyntacticallyInvalidByteRangeException(range);
+    }
+
+    boolean offered = rangeQueue.offer(rangeMarker);
+    assert offered;
+
+    return msg;
+  }
+
 }
